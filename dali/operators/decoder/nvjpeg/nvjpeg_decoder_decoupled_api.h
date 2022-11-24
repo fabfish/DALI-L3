@@ -37,6 +37,10 @@
 #include "dali/core/dev_buffer.h"
 #include "dali/operators/decoder/nvjpeg/permute_layout.h"
 
+#include "dali/operators/decoder/nvjpeg/l3_decoder.h"
+
+#define L3THREAD 32
+
 namespace dali {
 
 using ImageInfo = EncodedImageInfo<int>;
@@ -61,6 +65,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     device_buffers_(num_threads_),
     streams_(num_threads_),
     decode_events_(num_threads_),
+    l3_streams_(L3THREAD),
+    l3_decode_events_(L3THREAD),
+    l3_dev_alloc_(L3THREAD),
     thread_page_ids_(num_threads_),
     device_id_(spec.GetArgument<int>("device_id")),
     device_allocator_(nvjpeg_memory::GetDeviceAllocator()),
@@ -68,6 +75,9 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     thread_pool_(num_threads_,
                  spec.GetArgument<int>("device_id"),
                  spec.GetArgument<bool>("affine") /* pin threads */),
+    l3_thread_(1,
+               spec.GetArgument<int>("device_id"),
+               spec.GetArgument<bool>("affine") /* pin threads */),
     nvjpeg2k_thread_(1,
                      spec.GetArgument<int>("device_id"),
                      spec.GetArgument<bool>("affine")) {
@@ -158,12 +168,25 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       CUDA_CALL(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
                                              default_cuda_stream_priority_));
     }
+    for (auto &stream : l3_streams_) {
+      CUDA_CALL(cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking,
+                                             default_cuda_stream_priority_));
+    }
     CUDA_CALL(cudaStreamCreateWithPriority(
       &hw_decode_stream_, cudaStreamNonBlocking, default_cuda_stream_priority_));
 
     for (auto &event : decode_events_) {
       CUDA_CALL(cudaEventCreate(&event));
       CUDA_CALL(cudaEventRecord(event, streams_[0]));
+    }
+
+    for (auto &event : l3_decode_events_) {
+      CUDA_CALL(cudaEventCreate(&event));
+      CUDA_CALL(cudaEventRecord(event, l3_streams_[0]));
+    }
+
+    for (auto &devPtr : l3_dev_alloc_) {
+      CUDA_CALL(cudaMalloc(&devPtr, 2 * 1024 * 1024));
     }
 
     CUDA_CALL(cudaEventCreate(&hw_decode_event_));
@@ -225,6 +248,10 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
         CUDA_CALL(cudaStreamSynchronize(stream));
       }
 
+      for (auto &stream : l3_streams_) {
+        CUDA_CALL(cudaStreamSynchronize(stream));
+      }
+
       for (auto &stream  : jpeg_streams_) {
         NVJPEG_CALL(nvjpegJpegStreamDestroy(stream));
       }
@@ -239,7 +266,19 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
       for (auto &event : decode_events_) {
         CUDA_CALL(cudaEventDestroy(event));
       }
+      for (auto &event : l3_decode_events_) {
+        CUDA_CALL(cudaEventDestroy(event));
+      }
+
       CUDA_CALL(cudaEventDestroy(hw_decode_event_));
+
+      for (auto &stream : l3_streams_) {
+        CUDA_CALL(cudaStreamDestroy(stream));
+      }
+
+      for (auto &devPtr : l3_dev_alloc_) {
+        CUDA_CALL(cudaFree(devPtr));
+      }
 
       for (auto &stream : streams_) {
         CUDA_CALL(cudaStreamDestroy(stream));
@@ -295,6 +334,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     Nvjpeg2k,
 #endif  // NVJPEG2K_ENABLED
     Cache,
+    L3Cuda,
   };
 
   struct DecoderData {
@@ -362,6 +402,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
   std::vector<SampleData*> samples_hw_batched_;
   std::vector<SampleData*> samples_single_;
   std::vector<SampleData*> samples_jpeg2k_;
+  std::vector<SampleData*> samples_l3_;
 
   nvjpegJpegState_t state_hw_batched_ = nullptr;
 
@@ -480,6 +521,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
 #if NVJPEG2K_ENABLED
     samples_jpeg2k_.clear();
 #endif  // NVJPEG2K_ENABLED
+    samples_l3_.clear();
 
     for (int i = 0; i < curr_batch_size; i++) {
       const auto &in = ws.Input<CPUBackend>(0, i);
@@ -537,10 +579,17 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
         }
       } else if (crop_generator || !ParseNvjpeg2k(data, span<const uint8_t>(input_data, in_size))) {
         try {
-          data.method = DecodeMethod::Host;
           auto image = ImageFactory::CreateImage(input_data, in_size, output_image_type_);
           data.shape = image->PeekShape();
-          samples_host_.push_back(&data);
+          auto ret = (input_data[0] == 'L') && (input_data[1] == 'L') && (input_data[2] == 'L') && (input_data[3] == '.');
+
+          if (ret) {
+            data.method = DecodeMethod::L3Cuda;
+            samples_l3_.push_back(&data);
+          } else {
+            data.method = DecodeMethod::Host;
+            samples_host_.push_back(&data);
+          }
         } catch (const std::runtime_error &e) {
           DALI_FAIL(e.what() + ". File: " + data.file_name);
         }
@@ -606,6 +655,24 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
           CacheStore(sample->file_name, output_data, shape, streams_[tid]);
         }, task_priority_seq_--);  // FIFO order, since the samples were already ordered
     }
+  }
+
+  void ProcessImagesL3Cuda(MixedWorkspace &ws) {
+    l3_thread_.AddWork([this, &ws](int) {
+      auto &output = ws.OutputRef<GPUBackend>(0);
+      auto &input = ws.InputRef<CPUBackend>(0);
+      int s_id = 0;
+      for (auto *sample : samples_l3_) {
+        assert(sample);
+        auto i = sample->sample_idx;
+        auto *output_data = output.mutable_tensor<uint8_t>(i);
+        ImageCache::ImageShape shape = output_shape_[i].to_static<3>();
+        preprocess_l3_decode(output_data, input[i].data<uint8_t>(), input[i].size(),
+                             l3_dev_alloc_[s_id], l3_streams_[s_id]);
+        CacheStore(sample->file_name, output_data, shape, l3_streams_[s_id]);
+	s_id++;
+      }
+    });  // FIFO order, since the samples were already ordered
   }
 
 #if NVJPEG2K_ENABLED
@@ -754,20 +821,30 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     ProcessImagesCache(ws);
 
     ProcessImagesCuda(ws);
+    ProcessImagesL3Cuda(ws);
     ProcessImagesHost(ws);
     ProcessImagesJpeg2k(ws);
     thread_pool_.RunAll(false);  // don't block
     nvjpeg2k_thread_.RunAll(false);
+    l3_thread_.RunAll(false);
 
     ProcessImagesHw(ws);
 
     thread_pool_.WaitForWork();
     nvjpeg2k_thread_.WaitForWork();
+    l3_thread_.WaitForWork();
+
     // wait for all work in workspace main stream
     for (int tid = 0; tid < num_threads_; tid++) {
       CUDA_CALL(cudaEventRecord(decode_events_[tid], streams_[tid]));
       CUDA_CALL(cudaStreamWaitEvent(ws.stream(), decode_events_[tid], 0));
     }
+
+    for (int tid = 0; tid < L3THREAD; tid++) {
+      CUDA_CALL(cudaEventRecord(l3_decode_events_[tid], l3_streams_[tid]));
+      CUDA_CALL(cudaStreamWaitEvent(ws.stream(), l3_decode_events_[tid], 0));
+    }
+
     CUDA_CALL(cudaEventRecord(hw_decode_event_, hw_decode_stream_));
     CUDA_CALL(cudaStreamWaitEvent(ws.stream(), hw_decode_event_, 0));
 #if NVJPEG2K_ENABLED
@@ -781,6 +858,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
     thread_page_ids_[thread_id] ^= 1;  // negate LSB
     return 2*thread_id + page;
   }
+
 
   // Per sample worker called in a thread of the thread pool.
   // It decodes the encoded image `input_data` (host mem) into `output_data` (device mem) with
@@ -890,8 +968,11 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
   // Per thread
   std::vector<nvjpegBufferDevice_t> device_buffers_;
   std::vector<cudaStream_t> streams_;
-  cudaStream_t hw_decode_stream_;
   std::vector<cudaEvent_t> decode_events_;
+  std::vector<cudaStream_t> l3_streams_;
+  std::vector<cudaEvent_t> l3_decode_events_;
+  std::vector<void *> l3_dev_alloc_;
+  cudaStream_t hw_decode_stream_;
   cudaEvent_t hw_decode_event_;
   std::vector<int> thread_page_ids_;  // page index for double-buffering
 
@@ -911,6 +992,7 @@ class nvJPEGDecoder : public Operator<MixedBackend>, CachedDecoderImpl {
   nvjpegPinnedAllocator_t pinned_allocator_;
 
   ThreadPool thread_pool_;
+  ThreadPool l3_thread_;
   ThreadPool nvjpeg2k_thread_;
   static constexpr int kOutputDim = 3;
 

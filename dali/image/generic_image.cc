@@ -14,6 +14,7 @@
 
 #include "dali/image/generic_image.h"
 #include "dali/image/png.h"
+#include "dali/image/l3.h"
 #include "dali/util/ocv.h"
 
 namespace dali {

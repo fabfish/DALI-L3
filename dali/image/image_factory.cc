@@ -24,6 +24,7 @@
 #include "dali/image/tiff.h"
 #endif
 #include "dali/image/pnm.h"
+#include "dali/image/l3.h"
 
 namespace dali {
 
@@ -85,7 +86,7 @@ ImageFactory::CreateImage(const uint8_t *encoded_image, size_t length, DALIImage
   DALI_ENFORCE(CheckIsPNG(encoded_image, length) + CheckIsBMP(encoded_image, length) +
                CheckIsGIF(encoded_image, length) + CheckIsJPEG(encoded_image, length) +
                CheckIsTiff(encoded_image, length) + CheckIsPNM(encoded_image, length) +
-               CheckIsJPEG2k(encoded_image, length) == 1,
+               CheckIsJPEG2k(encoded_image, length) + CheckIsL3Image(encoded_image, length) == 1,
                "Encoded image has ambiguous format");
   if (CheckIsPNG(encoded_image, length)) {
     return std::make_unique<PngImage>(encoded_image, length, image_type);
@@ -105,6 +106,8 @@ ImageFactory::CreateImage(const uint8_t *encoded_image, size_t length, DALIImage
 #else
     return std::make_unique<TiffImage>(encoded_image, length, image_type);
 #endif
+  } else if (CheckIsL3Image(encoded_image, length)) {
+    return std::make_unique<L3Image>(encoded_image, length, image_type);
   }
   return std::make_unique<GenericImage>(encoded_image, length, image_type);
 }
