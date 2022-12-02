@@ -23,11 +23,12 @@ include_directories(SYSTEM ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 
 # For NVJPEG
 if (BUILD_NVJPEG)
-  find_package(NVJPEG 9.0 REQUIRED)
-  if(${CUDA_VERSION} VERSION_LESS ${NVJPEG_VERSION})
-    message(WARNING "Using nvJPEG ${NVJPEG_VERSION} together with CUDA ${CUDA_VERSION} "
-                    "requires NVIDIA drivers compatible with CUDA ${NVJPEG_VERSION} or later")
-  endif()
+  # find_package(NVJPEG 9.0 REQUIRED)
+  find_package(NVJPEG)
+  # if(${CUDA_VERSION} VERSION_LESS ${NVJPEG_VERSION})
+  #   message(WARNING "Using nvJPEG ${NVJPEG_VERSION} together with CUDA ${CUDA_VERSION} "
+  #                   "requires NVIDIA drivers compatible with CUDA ${NVJPEG_VERSION} or later")
+  # endif()
   include_directories(SYSTEM ${NVJPEG_INCLUDE_DIR})
   list(APPEND DALI_LIBS ${NVJPEG_LIBRARY})
   list(APPEND DALI_EXCLUDES libnvjpeg_static.a)
@@ -55,15 +56,18 @@ if (BUILD_NVJPEG2K)
 endif (BUILD_NVJPEG2K)
 
 # NVIDIA NPP library
-CUDA_find_library(CUDA_nppicc_static_LIBRARY nppicc_static)
-CUDA_find_library(CUDA_nppc_static_LIBRARY nppc_static)
+#CUDA_find_library(CUDA_nppicc_static_LIBRARY nppicc_static)
+CUDA_find_library(CUDA_nppicc_static_LIBRARY nppicc)
+#CUDA_find_library(CUDA_nppc_static_LIBRARY nppc_static)
+CUDA_find_library(CUDA_nppc_static_LIBRARY nppc)
 list(APPEND DALI_LIBS ${CUDA_nppicc_static_LIBRARY})
 list(APPEND DALI_EXCLUDES libnppicc_static.a)
 list(APPEND DALI_LIBS ${CUDA_nppc_static_LIBRARY})
 list(APPEND DALI_EXCLUDES libnppc_static.a)
 
 # cuFFT library
-CUDA_find_library(CUDA_cufft_static_LIBRARY cufft_static)
+# CUDA_find_library(CUDA_cufft_static_LIBRARY cufft_static)
+CUDA_find_library(CUDA_cufft_static_LIBRARY cufft)
 list(APPEND DALI_EXCLUDES libcufft_static.a)
 
 # CULIBOS needed when using static CUDA libs
